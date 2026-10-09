@@ -306,12 +306,16 @@ def _build_quote_push_channel(client):
     127.0.0.1:6379——外连即杀的沙箱里那一次拨号就是杀进程（2026-09-24
     实盘逐行核对）。
     """
-    from .quote_push_channel import RedisQuotePushChannel, ZmqQuotePushChannel
+    from .quote_push_channel import (
+        RedisQuotePushChannel, WinMsgQuotePushChannel, ZmqQuotePushChannel,
+    )
 
     transport_name = str(getattr(client, "transport_name", "redis") or "redis").lower()
     if transport_name in ("zmq",):
         address = _quote_push_zmq_address(client)
         return ZmqQuotePushChannel(connect_address=address)
+    if transport_name in ("winmsg",):
+        return WinMsgQuotePushChannel(account_id=client.account_id)
     if (transport_name not in ("redis", "", "default")
             and not getattr(client, "_redis_explicit", True)):
         raise RuntimeError(
@@ -4879,7 +4883,7 @@ class BigQmtXtTrader:
             redis_client = self._exec_events_redis_or_none()
             if redis_client is not None:
                 self._event_loop_redis(redis_client)
-            elif self._exec_transport_is_zmq():
+            elif self._exec_transport_has_push_channel():
                 self._event_loop_push_channel()
             else:
                 # pipe / mysql 没有推送通道（redis 传输的 redis 宕了也是）——
@@ -4887,8 +4891,9 @@ class BigQmtXtTrader:
                 # 它会自己退回来，外层重新探 redis。
                 self._event_loop_poll()
 
-    def _exec_transport_is_zmq(self):
-        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
+    def _exec_transport_has_push_channel(self):
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() in (
+            "zmq", "winmsg")
 
     def _exec_events_redis_or_none(self):
         """A REACHABLE Redis client for the exec-event channels, or None.

@@ -10,6 +10,8 @@
 |------|---------|------|------|---------|
 | **`redis`（默认）** | **~10ms** | ✅ | redis-py | 生产默认，也是实测最快的 |
 | `zmq` | ~95ms（drain）| ✅（tcp） | pyzmq | 没有 redis 时的同机方案 |
+| `pipe` | ~100ms（drain）| ❌ | 无三方包，Windows API | Windows 同机、禁 socket/禁 pip 的券商沙箱 |
+| `winmsg` | ~1 tick（drain） | ❌ | 无三方包，Windows API | Windows 同机会话内，小/中 payload RPC + callback push |
 | `mysql` | ~50ms+ | ✅ | DBUtils + 驱动 | 兼容兜底（Redis/ZMQ 都不可用时）|
 
 切换传输**只改一个配置字段 `transport`**，业务代码（handlers / `to_jsonable` / `process_request`）零改动。
@@ -33,10 +35,10 @@
                         │  send_request / start_receiving│
                         │  send_response / stop          │
                         └───┬────────┬─────────┬─────────┘
-                 ┌──────────▼┐  ┌────▼───┐  ┌──▼─────┐  ┌──────┐
-                 │  Redis     │  │  ZMQ   │  │ MySQL  │  │ SHM  │
-                 │  (默认)    │  │ (低延迟)│  │(兼容)  │  │(stub)│
-                 └────────────┘  └────────┘  └────────┘  └──────┘
+          ┌──────▼───┐ ┌──▼──┐ ┌──▼───┐ ┌──▼───┐ ┌──▼──────┐ ┌──▼──┐
+          │ Redis    │ │ ZMQ │ │ Pipe │ │MySQL │ │ WinMsg  │ │ SHM │
+          │ (默认)   │ │低延迟│ │本机  │ │兼容  │ │WM_COPYDATA│ │stub │
+          └──────────┘ └─────┘ └──────┘ └──────┘ └─────────┘ └─────┘
 ```
 
 传输层只负责"请求/响应怎么在网络上走"，不碰业务语义。抽象接口见
@@ -55,7 +57,7 @@
 
 ```python
 BIGQMT_REDIS_CONFIG = {
-    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql
+    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/pipe/winmsg/mysql
     "zmq": {
         "bind_address": "tcp://127.0.0.1:5560",  # Windows 同机使用 TCP 回环
     },
@@ -159,6 +161,39 @@ BIGQMT_REDIS_CONFIG = {
 
 注意：sqlite 连接线程绑定，sqlite 测试需 `check_same_thread=False` + `maxshared=0`。
 
+### WinMsg（`transport: winmsg`，隐藏窗口消息）
+
+- Windows-only，同机、同交互用户会话内使用
+- 服务端（大 QMT 策略进程）创建隐藏窗口，客户端用 `FindWindowW` 定位
+- 请求/响应通过 `WM_COPYDATA` 传 UTF-8 JSON payload
+- 客户端也创建一个隐藏回复窗口，按 `request_id` 匹配响应
+- 用 `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG, ...)` 避免窗口线程卡死时永久挂住
+- 默认单包上限 4MB，可通过 `winmsg.max_payload_bytes` 调整
+- 服务端不新开接收线程；窗口建在 QMT 当前线程，`adjust` 调
+  `drain_request_queue()` 非阻塞泵消息并执行 handler
+- 订单/成交事件和全推行情支持 WinMsg push channel：客户端订阅端创建隐藏接收
+  窗口，服务端发布时枚举这些窗口并 `WM_COPYDATA` 推送
+
+配置示例：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "transport": "winmsg",
+    "winmsg": {
+        "window_name": "bigqmt_rpc",
+        "max_payload_bytes": 4 * 1024 * 1024,
+    },
+}
+```
+
+适合：普通查询、小批量 K 线、单转债 20 日分钟 K 线这类中等 payload。
+不适合：全市场 full tick、很多标的的大批量历史数据。那些更适合 `pipe` 或未来
+共享内存通道。
+
+`winmsg` 支持 `drain_request_queue`，适合 QMT 不允许后台 Python 线程直接碰 API
+的环境。建议保留 `rpc_background_threads=False` 和较短的
+`schedule_adjust_interval`。
+
 ## 实测延迟对比（同机）
 
 基准脚本：`python bench_transports.py -n 100`
@@ -173,11 +208,13 @@ zmq      n=100  min=0.15   p50=0.21   p90=0.33   p99=20.62   avg=0.43 ms
 1. 服务端和客户端的 `transport` 字段**必须一致**
 2. zmq：不写 `zmq` 块时端口按账号自动派生 `tcp://127.0.0.1:{15560+账号%100}`，
    两端一致；要跨机或自定义端口时才写 `connect_address`/`bind_address`
-3. zmq/mysql：`background_threads` 由 `_build_rpc_service` 自动开，**不用手动配**
-4. zmq（大 QMT 进程内）：**保持 `schedule_adjust` 开**（默认就是开），否则 adjust
+3. winmsg：只支持同一 Windows 交互会话；两端 `window_name` 和账号必须一致；
+   callback push 也要求客户端进程保持运行并创建订阅窗口
+4. zmq/mysql：`background_threads` 由 `_build_rpc_service` 自动开，**不用手动配**
+5. zmq（大 QMT 进程内）：**保持 `schedule_adjust` 开**（默认就是开），否则 adjust
    空转占满 GIL 饿死接收线程 → RPC 超时
-5. mysql：两端连同一个数据库，schema 自动创建
-6. 切回 redis：删掉 `transport` 字段或设为 `"redis"`，无需改其他配置
+6. mysql：两端连同一个数据库，schema 自动创建
+7. 切回 redis：删掉 `transport` 字段或设为 `"redis"`，无需改其他配置
 
 ## 文件结构
 
@@ -187,6 +224,8 @@ src/bigqmt_signal_trader/transports/
 ├── base.py                # RpcTransport 抽象基类
 ├── redis_transport.py     # Redis 实现（默认，零行为变更）
 ├── zmq_transport.py       # ZMQ ROUTER/DEALER 实现
+├── pipe_transport.py      # Windows named pipe 实现
+├── winmsg_transport.py    # Windows hidden-window WM_COPYDATA 实现
 ├── mysql_transport.py     # MySQL + DBUtils 连接池
 └── factory.py             # build_transport(name, config) 工厂
 ```

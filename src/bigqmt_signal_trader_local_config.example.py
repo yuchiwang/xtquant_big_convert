@@ -60,8 +60,9 @@ BIGQMT_REDIS_CONFIG = {
     # a round trip has several (#343, live terminal 2026-09-22, ms):
     #     redis  True ping 407 / positions 197    False ping 102 / positions 103
     #     zmq    True ping 103 / positions 490    False ping  87 / positions  88
-    # True is only for a transport that cannot drain (none of the shipped
-    # ones need it).
+    # True is only for a transport that cannot drain. winmsg also drains: its
+    # hidden window is created on the QMT thread and pumped from adjust, so
+    # handlers do not run on a separate QMT-side window thread.
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
     "rpc_background_threads": False,
@@ -119,4 +120,14 @@ BIGQMT_REDIS_CONFIG = {
     # observe what m_nDirection / m_nOffsetFlag actually carry in live callbacks
     # — the buy/sell mapping in exec_events.py currently assumes 48/49 there.
     "exec_events_debug_raw_fields": False,
+    # Hidden-window WM_COPYDATA transport (only used when transport=winmsg).
+    # Windows same-host, same-user-session only. Server-side requests drain on
+    # adjust; client callback push uses hidden subscriber windows.
+    # Keep payloads modest; large whole-market frames should use pipe or a
+    # future shared-memory backend.
+    # "transport": "winmsg",
+    # "winmsg": {
+    #     "window_name": "bigqmt_rpc",
+    #     "max_payload_bytes": 4 * 1024 * 1024,
+    # },
 }

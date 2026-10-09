@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from bigqmt_signal_trader.quote_push_channel import (
     NullQuotePushChannel,
     RedisQuotePushChannel,
+    WinMsgQuotePushChannel,
     ZmqQuotePushChannel,
 )
 from bigqmt_signal_trader.quote_subscription_manager import (
@@ -62,6 +63,15 @@ class BuildQuoteSubscriptionServiceTest(unittest.TestCase):
         manager, channel = service
         self.assertIsInstance(channel, ZmqQuotePushChannel)
         self.assertEqual(channel.bind_address, "tcp://127.0.0.1:15561")
+
+    def test_winmsg_transport_builds_winmsg_channel(self):
+        service = build_quote_subscription_service(
+            FakeContextInfo(), transport_name="winmsg", account_id="acct",
+            redis_client=None, enabled=True,
+        )
+        manager, channel = service
+        self.assertIsInstance(manager, QuoteSubscriptionManager)
+        self.assertIsInstance(channel, WinMsgQuotePushChannel)
 
     def test_no_redis_non_zmq_gets_the_null_channel(self):
         """pipe（或 redis 被关的部署）没有推送线：空通道静默 noop，而不是

@@ -11,7 +11,7 @@ from .base import RpcTransport
 from .redis_transport import RedisTransport
 
 
-KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm", "pipe")
+KNOWN_TRANSPORTS = ("redis", "zmq", "mysql", "shm", "pipe", "winmsg")
 
 
 def transport_supports_drain(name):
@@ -36,6 +36,8 @@ def transport_supports_drain(name):
             from .mysql_transport import MysqlTransport as cls
         elif name == "pipe":
             from .pipe_transport import NamedPipeTransport as cls
+        elif name == "winmsg":
+            from .winmsg_transport import WinMsgTransport as cls
         else:
             return False
     except ImportError:
@@ -82,6 +84,20 @@ def build_transport(
             pipe_name=pipe_config.get("pipe_name") or "bigqmt_rpc",
             connect_timeout_seconds=float(
                 pipe_config.get("connect_timeout_seconds") or 5.0),
+        )
+    if name == "winmsg":
+        from .winmsg_transport import WinMsgTransport
+
+        winmsg_config = dict(config.get("winmsg") or {})
+        return WinMsgTransport(
+            account_id=account_id,
+            print_prefix=print_prefix,
+            window_name=winmsg_config.get("window_name") or "bigqmt_rpc",
+            max_payload_bytes=int(
+                winmsg_config.get("max_payload_bytes") or 4 * 1024 * 1024),
+            send_timeout_seconds=winmsg_config.get("send_timeout_seconds"),
+            startup_timeout_seconds=float(
+                winmsg_config.get("startup_timeout_seconds") or 5.0),
         )
     if name == "shm":
         return _build_shm(config, account_id, print_prefix)

@@ -12,5 +12,9 @@ See :mod:`~bigqmt_signal_trader.transports.factory`.
 
 from .base import RpcTransport, TransportError, TransportTimeout
 from .factory import build_transport
+from .winmsg_transport import WinMsgTransport
 
-__all__ = ["RpcTransport", "TransportError", "TransportTimeout", "build_transport"]
+__all__ = [
+    "RpcTransport", "TransportError", "TransportTimeout", "build_transport",
+    "WinMsgTransport",
+]

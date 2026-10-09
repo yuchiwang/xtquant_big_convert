@@ -16,9 +16,12 @@ Wire encoding is msgpack when available (smaller + faster for the
 channel stays usable without the optional dependency.
 """
 
+import ctypes
 import json
+import os
 import threading
 import time
+import uuid
 
 try:
     import msgpack
@@ -93,6 +96,274 @@ class NullQuotePushChannel(QuotePushChannel):
 
     def stop(self):
         pass
+
+
+WM_COPYDATA = 0x004A
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+SMTO_ABORTIFHUNG = 0x0002
+WINMSG_PUSH_DATA = 3
+
+
+def _winmsg_push_title_prefix(account_id=""):
+    return "bigqmt:winmsg:push:%s:" % str(account_id or "default")
+
+
+def _winmsg_user32():
+    if os.name != "nt":
+        raise RuntimeError("winmsg push channel is Windows-only")
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    return kernel32, user32, wintypes
+
+
+def _winmsg_ulong_ptr(wintypes):
+    return getattr(wintypes, "ULONG_PTR", ctypes.c_size_t)
+
+
+def _winmsg_lresult(wintypes):
+    return getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+
+
+def _winmsg_handle(wintypes, name):
+    return getattr(wintypes, name, wintypes.HANDLE)
+
+
+class WinMsgQuotePushChannel(QuotePushChannel):
+    """Whole-quote / exec-event push over hidden-window ``WM_COPYDATA``.
+
+    The server side is threadless: publishing enumerates client subscriber
+    windows and sends one message to each. Only the client subscriber owns a
+    message thread.
+    """
+
+    def __init__(self, account_id="", account_ids=None,
+                 print_prefix="[bigqmt_quote_push]", send_timeout_seconds=1.0):
+        self.account_id = str(account_id or "")
+        self.account_ids = _unique_accounts([self.account_id] + list(account_ids or []))
+        self.print_prefix = print_prefix
+        self.send_timeout_seconds = float(send_timeout_seconds or 1.0)
+        self._running = False
+        self._thread = None
+        self._ready = threading.Event()
+        self._hwnd = None
+        self._topics = set()
+        self._on_msg = None
+        self._error = None
+        self._wndproc = None
+        self._class_name = "BigQmtWinMsgPush_%s" % uuid.uuid4().hex
+        self._title = _winmsg_push_title_prefix(self.account_id) + uuid.uuid4().hex
+        self._kernel32 = None
+        self._user32 = None
+        self._wintypes = None
+        self._copydata_type = None
+        self._wndclass_type = None
+        self._wndproc_type = None
+
+    def _setup(self):
+        if self._user32 is not None:
+            return
+        self._kernel32, self._user32, self._wintypes = _winmsg_user32()
+        wintypes = self._wintypes
+        ulong_ptr = _winmsg_ulong_ptr(wintypes)
+        wndproc_type = ctypes.WINFUNCTYPE(
+            _winmsg_lresult(wintypes), wintypes.HWND, wintypes.UINT,
+            wintypes.WPARAM, wintypes.LPARAM)
+
+        class COPYDATASTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("dwData", ulong_ptr),
+                ("cbData", wintypes.DWORD),
+                ("lpData", ctypes.c_void_p),
+            ]
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", wndproc_type),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", _winmsg_handle(wintypes, "HINSTANCE")),
+                ("hIcon", _winmsg_handle(wintypes, "HICON")),
+                ("hCursor", _winmsg_handle(wintypes, "HCURSOR")),
+                ("hbrBackground", _winmsg_handle(wintypes, "HBRUSH")),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        self._copydata_type = COPYDATASTRUCT
+        self._wndclass_type = WNDCLASSW
+        self._wndproc_type = wndproc_type
+        user32 = self._user32
+        kernel32 = self._kernel32
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, _winmsg_handle(wintypes, "HMENU"),
+            _winmsg_handle(wintypes, "HINSTANCE"), ctypes.c_void_p,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        user32.DestroyWindow.restype = wintypes.BOOL
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = _winmsg_lresult(wintypes)
+        user32.GetMessageW.restype = wintypes.BOOL
+        user32.TranslateMessage.restype = wintypes.BOOL
+        user32.DispatchMessageW.restype = _winmsg_lresult(wintypes)
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(ulong_ptr)]
+        user32.SendMessageTimeoutW.restype = ulong_ptr
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.restype = ctypes.c_int
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = _winmsg_handle(wintypes, "HMODULE")
+
+    def start_publisher(self):
+        self._running = True
+
+    def _subscriber_titles(self):
+        self._setup()
+        titles = []
+        prefixes = [_winmsg_push_title_prefix(a) for a in (self.account_ids or [self.account_id])]
+        user32 = self._user32
+        wintypes = self._wintypes
+
+        enum_proc_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def enum_proc(hwnd, _lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            for prefix in prefixes:
+                if title.startswith(prefix):
+                    titles.append((hwnd, title))
+                    break
+            return True
+
+        user32.EnumWindows(enum_proc_type(enum_proc), 0)
+        return titles
+
+    def _send_raw(self, hwnd, payload):
+        raw = encode_push_payload(payload)
+        buf = ctypes.create_string_buffer(raw)
+        cds = self._copydata_type()
+        cds.dwData = WINMSG_PUSH_DATA
+        cds.cbData = len(raw)
+        cds.lpData = ctypes.cast(buf, ctypes.c_void_p)
+        result = _winmsg_ulong_ptr(self._wintypes)(0)
+        timeout_ms = int(max(0.001, self.send_timeout_seconds) * 1000)
+        ok = self._user32.SendMessageTimeoutW(
+            hwnd, WM_COPYDATA, 0, self._wintypes.LPARAM(ctypes.addressof(cds)),
+            SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
+        return bool(ok)
+
+    def publish(self, topic, data):
+        if not self._running:
+            return
+        payload = {"combo_key": topic, "data": data}
+        for hwnd, _title in self._subscriber_titles():
+            try:
+                self._send_raw(hwnd, payload)
+            except Exception as exc:
+                print("%s winmsg publish failed: %s" % (self.print_prefix, exc))
+
+    def start_subscriber(self, topics, on_msg):
+        self.stop()
+        self._topics = set(str(t) for t in (topics or []))
+        self._on_msg = on_msg
+        self._error = None
+        self._running = True
+        self._ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._sub_loop, name="bigqmt-winmsg-push-sub", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(5.0):
+            raise RuntimeError("winmsg push subscriber window did not start")
+        if self._error is not None:
+            raise self._error
+
+    def _sub_loop(self):
+        try:
+            self._setup()
+            self._wndproc = self._wndproc_type(self._handle_message)
+            hinst = self._kernel32.GetModuleHandleW(None)
+            cls = self._wndclass_type()
+            cls.lpfnWndProc = self._wndproc
+            cls.hInstance = hinst
+            cls.lpszClassName = self._class_name
+            atom = self._user32.RegisterClassW(ctypes.byref(cls))
+            if not atom and ctypes.get_last_error() not in (1410,):
+                raise RuntimeError("RegisterClassW failed")
+            self._hwnd = self._user32.CreateWindowExW(
+                0, self._class_name, self._title, 0,
+                0, 0, 0, 0, None, None, hinst, None)
+            if not self._hwnd:
+                raise RuntimeError("CreateWindowExW failed")
+            self._ready.set()
+            msg = self._wintypes.MSG()
+            while self._running:
+                rc = self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if rc <= 0:
+                    break
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:
+            self._error = exc
+            print("%s winmsg subscriber failed: %s" % (self.print_prefix, exc))
+            self._ready.set()
+        finally:
+            self._hwnd = None
+
+    def _handle_message(self, hwnd, msg, wparam, lparam):
+        if msg == WM_COPYDATA:
+            cds = ctypes.cast(lparam, ctypes.POINTER(self._copydata_type)).contents
+            if int(cds.dwData) == WINMSG_PUSH_DATA:
+                raw = ctypes.string_at(cds.lpData, cds.cbData)
+                payload = decode_push_payload(raw)
+                topic = str((payload or {}).get("combo_key") or "")
+                if topic in self._topics:
+                    try:
+                        self._on_msg(topic, (payload or {}).get("data"))
+                    except Exception as exc:
+                        print("%s subscriber callback failed: %s" %
+                              (self.print_prefix, exc))
+                return 1
+        if msg == WM_CLOSE:
+            self._user32.DestroyWindow(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            self._user32.PostQuitMessage(0)
+            return 0
+        return self._user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def stop(self):
+        self._running = False
+        hwnd = self._hwnd
+        if hwnd:
+            try:
+                self._user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(1.0)
+        self._thread = None
+        self._hwnd = None
 
 
 class ZmqQuotePushChannel(QuotePushChannel):

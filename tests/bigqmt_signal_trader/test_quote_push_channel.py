@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from bigqmt_signal_trader.quote_push_channel import (
     _HAS_MSGPACK,
     RedisQuotePushChannel,
+    WinMsgQuotePushChannel,
     ZmqQuotePushChannel,
     decode_push_payload,
     encode_push_payload,
@@ -231,6 +232,33 @@ class RedisPushChannelTest(unittest.TestCase):
         server.publish("SH", {"x": 1})
         server.stop()
         self.assertIn("bigqmt:quote_push:acct:SH", redis_client.messages)
+
+
+@unittest.skipUnless(os.name == "nt", "winmsg push is Windows-only")
+class WinMsgPushChannelTest(unittest.TestCase):
+    def test_pub_sub_roundtrip_and_topic_filter(self):
+        account_id = "acct-%d" % id(self)
+        server = WinMsgQuotePushChannel(account_id=account_id)
+        server.start_publisher()
+
+        received = []
+        done = threading.Event()
+        client = WinMsgQuotePushChannel(account_id=account_id)
+
+        def on_msg(topic, data):
+            received.append((topic, data))
+            done.set()
+
+        client.start_subscriber(["SH,SZ"], on_msg)
+        try:
+            server.publish("SH", {"600000.SH": {"lastPrice": 9.9}})
+            server.publish("SH,SZ", {"000001.SZ": {"lastPrice": 10.5}})
+            self.assertTrue(done.wait(2.0), "winmsg subscriber did not receive push")
+        finally:
+            client.stop()
+            server.stop()
+
+        self.assertEqual(received, [("SH,SZ", {"000001.SZ": {"lastPrice": 10.5}})])
 
 
 if __name__ == "__main__":

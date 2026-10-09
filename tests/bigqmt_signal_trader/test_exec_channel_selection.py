@@ -201,6 +201,22 @@ class ChannelSelectionTest(unittest.TestCase):
             {"exec:order", "exec:trade", "exec:order_error", "exec:cancel_error"})
         self.assertTrue(push.stopped)
 
+    def test_winmsg_transport_without_redis_uses_push_channel(self):
+        trader, _ = _trader("winmsg", None)
+        redis_client = _FakeRedisClient(ping_ok=False)
+        trader.client._redis = lambda: redis_client
+        push = _FakePushChannel(
+            stop=lambda: setattr(trader, "_event_running", False))
+
+        trader._event_running = True
+        with _patched_channel_builder(push):
+            trader._event_loop()
+
+        self.assertEqual(
+            set(push.topics or []),
+            {"exec:order", "exec:trade", "exec:order_error", "exec:cancel_error"})
+        self.assertTrue(push.stopped)
+
     def test_redis_transport_with_working_redis_still_uses_redis(self):
         trader, recorder = _trader("redis", None)
         redis_client = _FakeRedisClient(

@@ -33,6 +33,8 @@ BIGQMT_REDIS_CONFIG = {
     # Transport selection. Must match the QMT-side server config. Default
     # "redis" works with the standard DRYRUN; use "zmq" when the server runs
     # with transport=zmq (e.g. the no-redis version or explicit zmq mode).
+    # Use "pipe" or "winmsg" for Windows same-host deployments with no socket
+    # dependency. Both sides must use the same transport.
     "transport": "redis",
     # ZMQ-specific settings (only used when transport=zmq):
     # "zmq": {
@@ -42,6 +44,11 @@ BIGQMT_REDIS_CONFIG = {
     #     "connect_address": "tcp://127.0.0.1:15563",
     #     # "host": "127.0.0.1",
     #     # "port": 15563,
+    # },
+    # Hidden-window WM_COPYDATA settings (only used when transport=winmsg):
+    # "winmsg": {
+    #     "window_name": "bigqmt_rpc",
+    #     "max_payload_bytes": 4 * 1024 * 1024,
     # },
 }
 
@@ -99,7 +106,7 @@ BIGQMT_FORMULA_SERVER_CONFIG = {
 #   Server pushes each incremental tick batch to every client subscribed to the
 #   same combination; the RPC methods above only manage the subscription lifecycle.
 #   Data flows over a separate push channel matching `transport` above
-#   (redis pub/sub, or zmq PUB/SUB when transport="zmq"), msgpack-encoded
+#   (redis pub/sub, zmq PUB/SUB, or winmsg hidden-window push), msgpack-encoded
 #   (install the `msgpack` extra; falls back to json if absent).
 #
 #   quote_client_id: process-stable subscriber id. The server counts references

@@ -365,7 +365,8 @@ def build_quote_subscription_service(
     if not enabled:
         return None
     from .quote_push_channel import (
-        NullQuotePushChannel, RedisQuotePushChannel, ZmqQuotePushChannel,
+        NullQuotePushChannel, RedisQuotePushChannel, WinMsgQuotePushChannel,
+        ZmqQuotePushChannel,
     )
 
     source = ContextInfoQuoteSource(context_info)
@@ -376,6 +377,9 @@ def build_quote_subscription_service(
         extra = [_default_quote_push_zmq_bind(other) for other in served if other != str(account_id or "")]
         channel = ZmqQuotePushChannel(bind_address=bind_address, extra_bind_addresses=extra)
         push_endpoint = bind_address
+    elif transport_name == "winmsg":
+        channel = WinMsgQuotePushChannel(account_id=account_id, account_ids=served)
+        push_endpoint = ""
     elif redis_client is None:
         # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是
         # RedisQuotePushChannel(None) 每条事件一行 AttributeError。
