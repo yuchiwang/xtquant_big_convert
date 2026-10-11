@@ -41,7 +41,9 @@ BIGQMT_REDIS_CONFIG = {
     "full_tick_refresh_max_wall_seconds": 0.3,
     "full_tick_max_requests": 8,
 
-    "download_jobs_enabled": True,
+    # Async download jobs need Redis as the job/status store. In pure WinMsg
+    # mode there is no Redis client to pump, so keep the scheduler path quiet.
+    "download_jobs_enabled": False,
     "download_job_chunk_size": 10,
     "download_job_max_wall_seconds": 0.5,
     "download_job_ttl_seconds": 3600,

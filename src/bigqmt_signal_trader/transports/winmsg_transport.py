@@ -109,6 +109,7 @@ class WinMsgTransport(RpcTransport):
         self._window_lock = threading.RLock()
         self._drain_depth = 0
         self._drained_count = 0
+        self._drain_msg = None
 
         self._pending = {}
         self._pending_lock = threading.RLock()
@@ -412,7 +413,9 @@ class WinMsgTransport(RpcTransport):
         """
         self._ensure_window(server_mode=True)
         _kernel32, user32, wintypes = self._dlls()
-        msg = wintypes.MSG()
+        if self._drain_msg is None:
+            self._drain_msg = wintypes.MSG()
+        msg = self._drain_msg
         before = self._drained_count
         self._drain_depth += 1
         try:
