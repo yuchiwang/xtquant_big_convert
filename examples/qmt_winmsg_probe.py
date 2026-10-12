@@ -1,9 +1,10 @@
-# coding: utf-8
+#encoding:gbk
 """
 Big QMT WinMsg probe using ctypes + WM_COPYDATA only.
 
 Usage outside QMT:
     python examples/qmt_winmsg_probe.py --server
+    python examples/qmt_winmsg_probe.py --stop
 
 Usage inside a Big QMT strategy:
     1. Start the server command above in a normal Windows terminal.
@@ -34,7 +35,11 @@ ACCOUNT_ID = "default"
 WM_COPYDATA = 0x004A
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
+WM_QUIT = 0x0012
 SMTO_ABORTIFHUNG = 0x0002
+MSGFLT_ADD = 1
+MSGFLT_ALLOW = 1
+PM_REMOVE = 0x0001
 MSG_REQUEST = 1
 MSG_RESPONSE = 2
 
@@ -98,6 +103,13 @@ user32.DefWindowProcW.restype = LRESULT
 user32.DispatchMessageW.restype = LRESULT
 user32.TranslateMessage.restype = wintypes.BOOL
 user32.GetMessageW.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT,
+    wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.PostMessageW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostMessageW.restype = wintypes.BOOL
 user32.PostQuitMessage.argtypes = [ctypes.c_int]
 user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
 user32.FindWindowW.restype = wintypes.HWND
@@ -105,6 +117,17 @@ user32.SendMessageTimeoutW.argtypes = [
     wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     wintypes.UINT, wintypes.UINT, ctypes.POINTER(ULONG_PTR)]
 user32.SendMessageTimeoutW.restype = ULONG_PTR
+try:
+    user32.ChangeWindowMessageFilterEx.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p]
+    user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+except AttributeError:
+    pass
+try:
+    user32.ChangeWindowMessageFilter.argtypes = [wintypes.UINT, wintypes.DWORD]
+    user32.ChangeWindowMessageFilter.restype = wintypes.BOOL
+except AttributeError:
+    pass
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = HMODULE
 
@@ -130,6 +153,26 @@ def _last_error_message(prefix):
     return "%s failed, GetLastError=%s" % (prefix, ctypes.get_last_error())
 
 
+def _allow_copydata_through_uipi(hwnd):
+    change_ex = getattr(user32, "ChangeWindowMessageFilterEx", None)
+    if change_ex is not None:
+        ctypes.set_last_error(0)
+        if change_ex(hwnd, WM_COPYDATA, MSGFLT_ALLOW, None):
+            return True
+        err = ctypes.get_last_error()
+        if err not in (0, 5, 87):
+            print("[winmsg-probe] ChangeWindowMessageFilterEx failed, GetLastError=%s" % err)
+    change = getattr(user32, "ChangeWindowMessageFilter", None)
+    if change is not None:
+        ctypes.set_last_error(0)
+        if change(WM_COPYDATA, MSGFLT_ADD):
+            return True
+        err = ctypes.get_last_error()
+        if err not in (0, 5, 87):
+            print("[winmsg-probe] ChangeWindowMessageFilter failed, GetLastError=%s" % err)
+    return False
+
+
 def _send_copydata(target_hwnd, sender_hwnd, msg_type, payload, timeout_ms=2000):
     raw = _json_bytes(payload)
     buf = ctypes.create_string_buffer(raw)
@@ -139,7 +182,8 @@ def _send_copydata(target_hwnd, sender_hwnd, msg_type, payload, timeout_ms=2000)
     cds.lpData = ctypes.cast(buf, ctypes.c_void_p)
     result = ULONG_PTR()
     ok = user32.SendMessageTimeoutW(
-        target_hwnd, WM_COPYDATA, sender_hwnd, ctypes.byref(cds),
+        target_hwnd, WM_COPYDATA, sender_hwnd,
+        wintypes.LPARAM(ctypes.addressof(cds)),
         SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result))
     if not ok:
         raise OSError(ctypes.get_last_error(), "SendMessageTimeoutW failed")
@@ -150,6 +194,17 @@ def _read_copydata(lparam):
     cds = ctypes.cast(lparam, ctypes.POINTER(COPYDATASTRUCT)).contents
     raw = ctypes.string_at(cds.lpData, cds.cbData)
     return cds.dwData, json.loads(raw.decode("utf-8"))
+
+
+def _pump_messages_polling(sleep_seconds=0.02):
+    msg = wintypes.MSG()
+    while True:
+        while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+            if msg.message == WM_QUIT:
+                return
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+        time.sleep(sleep_seconds)
 
 
 class HiddenWindow(object):
@@ -175,6 +230,7 @@ class HiddenWindow(object):
             0, 0, 0, 0, None, None, hinst, None)
         if not self.hwnd:
             raise OSError(ctypes.get_last_error(), "CreateWindowExW failed")
+        _allow_copydata_through_uipi(self.hwnd)
 
     def _handle_message(self, hwnd, msg, wparam, lparam):
         if msg == WM_COPYDATA:
@@ -185,6 +241,9 @@ class HiddenWindow(object):
             except Exception as exc:
                 print("[winmsg-probe] on_copydata error: %r" % (exc,))
                 return 0
+        if msg == WM_CLOSE:
+            user32.DestroyWindow(hwnd)
+            return 0
         if msg == WM_DESTROY:
             user32.PostQuitMessage(0)
             return 0
@@ -273,6 +332,12 @@ class WinMsgProbeServer(object):
     def _on_copydata(self, _hwnd, sender_hwnd, msg_type, payload):
         if msg_type != MSG_REQUEST:
             return
+        thread = threading.Thread(
+            target=self._send_response, args=(sender_hwnd, payload))
+        thread.daemon = True
+        thread.start()
+
+    def _send_response(self, sender_hwnd, payload):
         response = {
             "ok": True,
             "request_id": payload.get("request_id"),
@@ -280,19 +345,36 @@ class WinMsgProbeServer(object):
             "echo": payload,
         }
         reply_hwnd = int(payload.get("reply_hwnd") or sender_hwnd)
-        _send_copydata(reply_hwnd, self.window.hwnd, MSG_RESPONSE, response)
-        print("[winmsg-probe] request %s from hwnd=%s method=%s" % (
-            payload.get("request_id"), reply_hwnd, payload.get("method")))
+        try:
+            _send_copydata(reply_hwnd, self.window.hwnd, MSG_RESPONSE, response)
+            print("[winmsg-probe] request %s from hwnd=%s method=%s" % (
+                payload.get("request_id"), reply_hwnd, payload.get("method")))
+        except Exception as exc:
+            print("[winmsg-probe] response error for request %s hwnd=%s: %r" % (
+                payload.get("request_id"), reply_hwnd, exc))
 
     def run_forever(self):
         print("[winmsg-probe] server ready: class=%s title=%s hwnd=%s" % (
             _server_class(self.window_name, self.account_id),
             _server_title(self.window_name, self.account_id),
             self.window.hwnd))
-        msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+        try:
+            _pump_messages_polling()
+        except KeyboardInterrupt:
+            self.window.close()
+
+
+def stop_server(window_name=WINDOW_NAME, account_id=ACCOUNT_ID):
+    hwnd = user32.FindWindowW(
+        _server_class(window_name, account_id),
+        _server_title(window_name, account_id))
+    if not hwnd:
+        print("[winmsg-probe] server not found")
+        return 1
+    if not user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
+        raise OSError(ctypes.get_last_error(), "PostMessageW failed")
+    print("[winmsg-probe] stop posted to hwnd=%s" % hwnd)
+    return 0
 
 
 pipe = None
@@ -335,10 +417,13 @@ def stop(context):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", action="store_true", help="run external echo server")
+    parser.add_argument("--stop", action="store_true", help="stop external echo server")
     parser.add_argument("--client", action="store_true", help="run a normal Python client ping")
     args = parser.parse_args(argv)
     if args.server:
         WinMsgProbeServer().run_forever()
+    elif args.stop:
+        return stop_server()
     elif args.client:
         client = WinMsgProbeClient()
         try:
