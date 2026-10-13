@@ -54,6 +54,7 @@ ERROR_PIPE_CONNECTED = 535
 
 BUFFER_BYTES = 1 << 20
 CONNECT_POLL_SECONDS = 0.05
+CONNECT_TIMEOUT_SECONDS = 15.0
 
 
 if os.name != "nt":
@@ -150,7 +151,7 @@ def _close(handle):
 
 class PipeProbeClient(object):
     def __init__(self, pipe_name=PIPE_NAME, account_id=ACCOUNT_ID,
-                 connect_timeout_seconds=5.0):
+                 connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS):
         self.path = pipe_path(pipe_name, account_id)
         self.connect_timeout_seconds = float(connect_timeout_seconds)
 
@@ -168,7 +169,12 @@ class PipeProbeClient(object):
             err = _last_error()
             if err not in (ERROR_PIPE_BUSY, ERROR_FILE_NOT_FOUND) \
                     or time.time() >= deadline:
-                raise OSError(err, "cannot connect to named pipe %s" % self.path)
+                raise OSError(
+                    err,
+                    "cannot connect to named pipe %s after %.1fs; "
+                    "start external server first: "
+                    "python examples/qmt_pipe_probe.py --server" % (
+                        self.path, self.connect_timeout_seconds))
             time.sleep(CONNECT_POLL_SECONDS)
 
     def _cancel_read(self, handle):
@@ -304,6 +310,7 @@ def _qmt_log(text):
 def init(context):
     global pipe
     pipe = PipeProbeClient()
+    _qmt_log("[PipeProbe] connecting to %s" % pipe.path)
     response = pipe.send_request(
         {"method": "init_ping", "params": {"source": "bigqmt"}})
     _qmt_log("[PipeProbe] init ok: %s" % response)
@@ -313,6 +320,7 @@ def handle_bar(context, bar):
     global pipe
     if pipe is None:
         pipe = PipeProbeClient()
+        _qmt_log("[PipeProbe] connecting to %s" % pipe.path)
     symbol = getattr(bar, "symbol", "")
     response = pipe.send_request({
         "method": "bar_ping",
