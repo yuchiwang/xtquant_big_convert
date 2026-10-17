@@ -8,7 +8,7 @@ Copy this file to the QMT python directory as:
 The client-side config must also use ``transport="winmsg"``.
 """
 
-BIGQMT_ACCOUNT_ID = "8885456416"
+BIGQMT_ACCOUNT_ID = "62209099"
 BIGQMT_ACCOUNT_TYPE = "STOCK"
 
 BIGQMT_REDIS_CONFIG = {

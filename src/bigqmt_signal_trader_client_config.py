@@ -45,7 +45,7 @@ BIGQMT_LOCAL_CACHE_CONFIG = {
 }
 
 BIGQMT_FORMULA_SERVER_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     # "host": "127.0.0.1",
     # "port": 58600,
     # "qmt_root": r"D:\国金证券QMT交易端",
