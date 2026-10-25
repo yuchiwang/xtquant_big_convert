@@ -66,6 +66,166 @@ ERROR_FILE_NOT_FOUND = 2
 _BUFFER_BYTES = 1 << 20      # 1MB: whole-market quote frames are large
 _CONNECT_POLL_SECONDS = 0.05
 
+# 显式管道 DACL 用的权限位（winnt.h）。0x001F01FF = FILE_ALL_ACCESS；
+# 0x00120089 是默认模板给 Everyone 的那组只读权限（read access/EA/
+# attributes + READ_CONTROL + SYNCHRONIZE，从默认安全属性建出来的管道上
+# dump DACL 实测得到）。
+FILE_ALL_ACCESS = 0x001F01FF
+PIPE_READ_ONLY_ACCESS = 0x00120089
+
+
+class _SecurityAttributes(ctypes.Structure):
+    # QMT 自带 Python 3.6 的 wintypes 缺这缺那（见 _kernel32 的注释），
+    # 所以手写结构体而不是 from ctypes import wintypes。
+    _fields_ = [
+        ("nLength", ctypes.c_ulong),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int),
+    ]
+
+
+class _SecurityDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("Revision", ctypes.c_ubyte),
+        ("Sbz1", ctypes.c_ubyte),
+        ("Control", ctypes.c_ushort),
+        ("Sbz2", ctypes.c_ushort),
+        ("Owner", ctypes.c_void_p),
+        ("Group", ctypes.c_void_p),
+        ("Sacl", ctypes.c_void_p),
+        ("Dacl", ctypes.c_void_p),
+    ]
+
+
+def pipe_security_attributes():
+    """带显式 DACL 的 SECURITY_ATTRIBUTES；任何一步失败返回 None。
+
+    为什么需要它：提权运行的 QMT（计划任务 -RunLevel Highest，或手动
+    「以管理员身份运行」）用默认安全属性建管道时，默认模板把完整权限只给
+    SYSTEM / Administrators（owner 也解析成 Administrators），Everyone 只
+    读。同用户的**非提权**进程令牌里 Administrators SID 是 deny-only，
+    CreateFileW 要 GENERIC_WRITE 直接 err=5 拒绝访问。实测：QMT 提权运行
+    时，交互终端里的非提权探活 connect() 报 ``cannot connect (err=5)``，
+    同一脚本提权跑立刻连通 —— 提权不一致，管道就断了。
+
+    修法是把「创建进程的用户 SID」显式写进 DACL 给完整权限。用户 SID 不随
+    提权变化（提权只是把组 SID 从 deny-only 翻成 enabled），所以这一条 ACE
+    同时覆盖两个方向：提权服务端 + 非提权客户端，非提权服务端 + 提权客户
+    端。默认模板的其余语义保留：SYSTEM / Administrators 完整权限、
+    Everyone 只读（Anonymous 只读那条省了 —— 本机本会话的客户端永远带着
+    真实用户令牌来连）。
+
+    返回 ``(SECURITY_ATTRIBUTES, keepalive)``。绝对形式的
+    SECURITY_DESCRIPTOR 的 Dacl 指针、ACL 里的 SID 指针都指向 Python 堆上
+    的缓冲，必须整体存活到 CreateNamedPipeW 返回之后（内核把安全描述符
+    拷进对象，但调用方的缓冲只读不拷）—— keepalive 由调用方持有。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        return _build_pipe_security_attributes()
+    except Exception:
+        return None
+
+
+def _build_pipe_security_attributes():
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    TOKEN_QUERY = 0x0008
+    TOKEN_USER = 1
+    ACL_REVISION = 2
+    SD_REVISION = 1
+
+    keepalive = []
+
+    def _sid_from_string(text):
+        # ConvertStringSidToSidW 返回 LocalAlloc 的缓冲。不 LocalFree：
+        # 一次性分配、进程存活期内保活，省掉把 SID 深拷贝进 Python 缓冲
+        # 的手写代码 —— 三个 SID 总共几十字节。
+        psid = ctypes.c_void_p()
+        if not advapi32.ConvertStringSidToSidW(text, ctypes.byref(psid)) \
+                or not psid.value:
+            return None
+        return psid.value
+
+    # 当前进程令牌的用户 SID。注意不是 Administrators 组 SID：组 SID 在非
+    # 提权令牌里是 deny-only，写进 DACL 也救不了非提权客户端。
+    # ctypes 两个坑都要堵：GetCurrentProcess 不设 restype 会把伪句柄 -1
+    # 截成 32 位（OpenProcessToken 报 err=6）；反过来设了 restype 后返回
+    # 的指针值又超出 int32，OpenProcessToken 不设 argtypes 会拒收。
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcessToken.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    # advapi32 同理：SID/ACL 都是指针值，超过 int32 的裸 int 不设 argtypes
+    # 会被 ctypes 直接拒收（ArgumentError），异常被吞掉就回退 None 了。
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetTokenInformation.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+        ctypes.POINTER(ctypes.c_ulong)]
+    advapi32.InitializeAcl.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+    advapi32.AddAccessAllowedAce.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+    token = ctypes.c_void_p()
+    if not kernel32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)):
+        return None
+    try:
+        class _TokenUser(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p),
+                        ("Attributes", ctypes.c_ulong)]
+
+        needed = ctypes.c_ulong(0)
+        advapi32.GetTokenInformation(token, TOKEN_USER, None, 0,
+                                     ctypes.byref(needed))
+        size = int(needed.value) or ctypes.sizeof(_TokenUser)
+        buf = ctypes.create_string_buffer(size)
+        if not advapi32.GetTokenInformation(token, TOKEN_USER, buf, size,
+                                            ctypes.byref(needed)):
+            return None
+        user_sid = _TokenUser.from_buffer(buf).Sid
+        keepalive.append(buf)
+    finally:
+        kernel32.CloseHandle(token)
+
+    if not user_sid:
+        return None
+
+    grants = (
+        (FILE_ALL_ACCESS, user_sid),
+        (FILE_ALL_ACCESS, _sid_from_string(u"S-1-5-18")),      # LocalSystem
+        (FILE_ALL_ACCESS, _sid_from_string(u"S-1-5-32-544")),  # Administrators
+        (PIPE_READ_ONLY_ACCESS, _sid_from_string(u"S-1-1-0")),  # Everyone 只读
+    )
+
+    # 8 字节 ACL 头 + 4 个 ACE（各 8 字节头 + 4 字节 mask + SID）。
+    # 512 字节远超最坏情况，InitializeAcl 只记录容量。
+    acl_size = 512
+    acl = ctypes.create_string_buffer(acl_size)
+    if not advapi32.InitializeAcl(acl, acl_size, ACL_REVISION):
+        return None
+    for mask, sid in grants:
+        if sid is None:
+            continue
+        if not advapi32.AddAccessAllowedAce(acl, ACL_REVISION, mask, sid):
+            return None
+
+    sd = _SecurityDescriptor()
+    if not advapi32.InitializeSecurityDescriptor(ctypes.byref(sd), SD_REVISION):
+        return None
+    if not advapi32.SetSecurityDescriptorDacl(ctypes.byref(sd), 1, acl, 0):
+        return None
+
+    sa = _SecurityAttributes()
+    sa.nLength = ctypes.sizeof(_SecurityAttributes)
+    sa.lpSecurityDescriptor = ctypes.cast(
+        ctypes.byref(sd), ctypes.c_void_p).value
+    sa.bInheritHandle = 0
+    keepalive.extend((sd, acl))
+    return sa, keepalive
+
 
 def _kernel32():
     if os.name != "nt":
@@ -129,6 +289,8 @@ class NamedPipeTransport(RpcTransport):
         # DEALER, and the reason that fix is not worth repeating here.
         self._client_local = threading.local()
         self._client_handles = []
+        # 显式 DACL 的 SECURITY_ATTRIBUTES(含保活引用), 懒建一次。
+        self._security_attributes = None
         # 读缓冲也按线程持有 —— 见 _read_buffer 里的实测数字。
         self._io_local = threading.local()
 
@@ -137,6 +299,11 @@ class NamedPipeTransport(RpcTransport):
         if self._k32 is None:
             self._k32, self._wintypes = _kernel32()
         return self._k32
+
+    def _pipe_security(self):
+        if self._security_attributes is None:
+            self._security_attributes = pipe_security_attributes()
+        return self._security_attributes
 
     def _last_error(self):
         return ctypes.get_last_error()
@@ -318,11 +485,16 @@ class NamedPipeTransport(RpcTransport):
 
     def _accept_loop(self):
         dll = self._dll()
+        # 显式 DACL：默认安全属性建出的管道只让 Administrators 写，提权 QMT
+        # 服务端 + 非提权客户端直接 err=5（见 pipe_security_attributes）。
+        # 构建失败回退 None —— 行为与改动前一致。
+        security = self._pipe_security()
         while self._running:
             handle = dll.CreateNamedPipeW(
                 self.path, PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
+                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0,
+                ctypes.byref(security[0]) if security else None)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:
                     return

@@ -28,6 +28,7 @@ from .pipe_transport import (
     _CONNECT_POLL_SECONDS,
     _kernel32,
     pipe_path,
+    pipe_security_attributes,
     DEFAULT_PIPE_NAME,
     ERROR_BROKEN_PIPE,
     ERROR_FILE_NOT_FOUND,
@@ -92,6 +93,10 @@ class PipeQuotePushChannel(object):
 
     def _accept_loop(self):
         dll, _ = self._dll()
+        # 显式 DACL：和 pipe_transport 同一条修复 —— 提权服务端建的管道
+        # 默认不让同用户非提权客户端连（err=5）。订阅端要 CreateFileW +
+        # SetNamedPipeHandleState，同样吃写权限。
+        security = pipe_security_attributes()
         while self._running:
             # DUPLEX, not OUTBOUND: the client's SetNamedPipeHandleState
             # (message read mode) needs GENERIC_WRITE on its handle, and an
@@ -100,7 +105,8 @@ class PipeQuotePushChannel(object):
             handle = dll.CreateNamedPipeW(
                 self.bind_address, PIPE_ACCESS_DUPLEX,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0, None)
+                PIPE_UNLIMITED_INSTANCES, _BUFFER_BYTES, _BUFFER_BYTES, 0,
+                ctypes.byref(security[0]) if security else None)
             if handle == INVALID_HANDLE_VALUE:
                 if not self._running:
                     return

@@ -19,6 +19,7 @@
 传输层快 26 倍，但端到端只省 0.8ms —— 瓶颈在桥内处理，不在线缆。这一点要写在
 这里，免得有人拿裸 IPC 的 66 倍去做架构决策。
 """
+import ctypes
 import os
 import sys
 import threading
@@ -32,7 +33,11 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from bigqmt_signal_trader.transports.base import TransportError
 from bigqmt_signal_trader.transports.factory import KNOWN_TRANSPORTS, build_transport
 from bigqmt_signal_trader.transports.pipe_transport import (
-    NamedPipeTransport, pipe_path,
+    FILE_ALL_ACCESS,
+    PIPE_READ_ONLY_ACCESS,
+    NamedPipeTransport,
+    pipe_path,
+    pipe_security_attributes,
 )
 
 
@@ -399,6 +404,123 @@ class ShutdownTest(unittest.TestCase):
         pair = _Pair("bigqmt_test_double_stop")
         pair.close()
         pair.close()
+
+
+@WINDOWS_ONLY
+class ExplicitDaclTest(unittest.TestCase):
+    """提权 QMT 建管道 + 非提权客户端 = err=5（见 pipe_security_attributes）。
+
+    旧代码把安全属性传 None，默认 DACL 的完整权限只属于 SYSTEM /
+    Administrators —— 同用户非提权进程的 Administrators SID 是 deny-only，
+    写管道直接拒绝。这条测试 walk 出建好的管道的真实 DACL，钉住两件事：
+    当前用户 SID 有写权限（修复本体），Everyone 保持只读（不比默认宽）。
+    """
+
+    def _current_user_sid(self):
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # 不设 restype 时 GetCurrentProcess 的伪句柄 -1 被截成 32 位，
+        # OpenProcessToken 报 err=6；设了 restype 又必须配 argtypes，指针
+        # 值超 int32 会拒收 —— 生产代码同一条注释。
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcessToken.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        advapi32.GetTokenInformation.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_ulong)]
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        token = ctypes.c_void_p()
+        if not kernel32.OpenProcessToken(
+                kernel32.GetCurrentProcess(), 0x8, ctypes.byref(token)):
+            self.skipTest("cannot open own process token")
+        try:
+            class _TokenUser(ctypes.Structure):
+                _fields_ = [("Sid", ctypes.c_void_p),
+                            ("Attributes", ctypes.c_ulong)]
+
+            needed = ctypes.c_ulong(0)
+            advapi32.GetTokenInformation(
+                token, 1, None, 0, ctypes.byref(needed))
+            buf = ctypes.create_string_buffer(needed.value)
+            self.assertTrue(advapi32.GetTokenInformation(
+                token, 1, buf, needed.value, ctypes.byref(needed)))
+            text = ctypes.c_wchar_p()
+            self.assertTrue(advapi32.ConvertSidToStringSidW(
+                _TokenUser.from_buffer(buf).Sid, ctypes.byref(text)))
+            return text.value
+        finally:
+            kernel32.CloseHandle(token)
+
+    def _pipe_dacl_aces(self, path):
+        """[(sid_string, mask), ...]。用 Everyone 都有的只读权限打开管道，
+        再 GetSecurityInfo 读回内核里的真实 DACL —— 不碰我们自己拼的结构，
+        测的是 CreateNamedPipeW 真正生效的那份。"""
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        handle = kernel32.CreateFileW(path, 0x80000000, 0, None, 3, 0, None)
+        self.assertNotEqual(handle, ctypes.c_void_p(-1).value,
+                            "只读打开都失败，DACL 比默认模板还紧")
+        try:
+            dacl = ctypes.c_void_p()
+            # 6 = SE_KERNEL_OBJECT, 4 = DACL_SECURITY_INFORMATION
+            self.assertEqual(
+                advapi32.GetSecurityInfo(
+                    handle, 6, 4, None, None, ctypes.byref(dacl),
+                    None, None), 0)
+            self.assertTrue(dacl.value, "管道没有 DACL")
+            count = ctypes.c_ushort.from_address(dacl.value + 4).value
+            aces = []
+            addr = dacl.value + 8
+            for _ in range(count):
+                size = ctypes.c_ushort.from_address(addr + 2).value
+                mask = ctypes.c_ulong.from_address(addr + 4).value
+                text = ctypes.c_wchar_p()
+                advapi32.ConvertSidToStringSidW(
+                    ctypes.c_void_p(addr + 8), ctypes.byref(text))
+                aces.append((text.value, mask))
+                addr += size
+            return aces
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def test_created_pipe_grants_the_current_user_write_access(self):
+        pair = _Pair("bigqmt_test_dacl")
+        self.addCleanup(pair.close)
+        user_sid = self._current_user_sid()
+        masks = [mask for sid, mask in self._pipe_dacl_aces(pair.server.path)
+                 if sid == user_sid]
+        self.assertTrue(masks, "DACL 里没有当前用户的 ACE —— 提权不一致时会 err=5")
+        self.assertTrue(any(mask & 0x2 for mask in masks),
+                        "当前用户只有读权限，写不进去")
+
+    def test_everyone_stays_read_only(self):
+        pair = _Pair("bigqmt_test_dacl_ro")
+        self.addCleanup(pair.close)
+        masks = [mask for sid, mask in self._pipe_dacl_aces(pair.server.path)
+                 if sid == "S-1-1-0"]
+        self.assertTrue(masks, "Everyone 的只读 ACE 不见了，语义和默认模板不一致")
+        self.assertFalse(any(mask & 0x2 for mask in masks),
+                         "Everyone 拿到了写权限，比默认模板宽了")
+
+    def test_helper_actually_builds_on_windows(self):
+        """构建失败会静默回退默认安全属性，没有任何报错 —— 伪句柄截断那
+        个 bug 就是这样溜进来的：helper 一直返回 None，所有测试照样全绿。
+        这条钉死 Windows 上必须真的建出 SECURITY_ATTRIBUTES。"""
+        built = pipe_security_attributes()
+        self.assertIsNotNone(
+            built, "显式 DACL 构建失败, 静默回退了默认安全属性 (err=5 修复没生效)")
+        sa, keepalive = built
+        self.assertEqual(sa.nLength, ctypes.sizeof(sa))
+        self.assertTrue(keepalive, "保活引用丢了，ACL 缓冲可能被回收")
 
 
 @WINDOWS_ONLY
